@@ -1,0 +1,64 @@
+### Build artifacts (C/C++)
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.d
+*.gcno
+*.gcda
+*.gcov
+
+### Produced binaries (project-specific)
+example_usage
+test_basic
+test_stress
+test_perf
+test_mt
+test_realloc_preserve
+
+### CMake / build directories
+build*/
+cmake-build-*/
+
+### CMake/CTest generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+### Sanitizers / crash dumps / profiler outputs
+asan_*.log
+tsan_*.log
+ubsan_*.log
+msan_*.log
+vgcore.*
+core
+core.*
+*.stackdump
+perf.data
+perf.data.*
+
+### Temporary files
+*~
+*.swp
+*.swo
+*.tmp
+*.temp
+.cache/
+
+### IDE/editor settings
+.idea/
+.vscode/
+
+### OS junk
+.DS_Store
+Thumbs.db

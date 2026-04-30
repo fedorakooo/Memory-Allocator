@@ -1,33 +1,54 @@
 # Memory-Allocator
 
-Dynamic memory allocator in **C11** with strict warnings (`-Wall -Wextra -Werror`).
+A custom dynamic memory allocator in C11 with a `malloc`-like API:
 
-This project provides a small `malloc`-like API (`my_malloc`, `my_free`, `my_calloc`, `my_realloc`) plus `allocator_stats()`. Internally it uses **size classes** with a **per-thread cache** for small allocations and **direct OS mappings** for large allocations.
+- `my_malloc`
+- `my_free`
+- `my_calloc`
+- `my_realloc`
+- `allocator_stats`
+
+The implementation is split into:
+
+- a small-object path (size classes, central allocator, per-thread cache), and
+- a large-object path (direct OS mapping per allocation).
+
+Compilation is configured for strict diagnostics: `-std=c11 -Wall -Wextra -Werror -pedantic`.
+
+## Design goals
+
+- Provide a clear educational allocator architecture with explicit modules.
+- Keep the hot path for small allocations thread-local when possible.
+- Use page-granular OS mappings and span metadata for small-object ownership.
+- Keep API behavior explicit and testable.
 
 ## Public API
 
-Declared in [`allocator/include/allocator.h`](allocator/include/allocator.h):
+Declared in `allocator/include/allocator.h`:
 
-- `void* my_malloc(size_t size)`
-- `void  my_free(void* ptr)`
-- `void* my_calloc(size_t nmemb, size_t size)`
-- `void* my_realloc(void* ptr, size_t size)`
-- `void  allocator_stats(void)`
+- `void* my_malloc(size_t size);`
+- `void my_free(void* ptr);`
+- `void* my_calloc(size_t nmemb, size_t size);`
+- `void* my_realloc(void* ptr, size_t size);`
+- `void allocator_stats(void);`
 
-## High-level design
+## API semantics
 
-### Small vs large allocations
+Behavior implemented and validated by tests:
 
-The entry points are implemented in [`allocator/src/api/alloc_api.c`](allocator/src/api/alloc_api.c):
+- `my_malloc(0)` returns `NULL`.
+- `my_free(NULL)` is a no-op.
+- `my_calloc(nmemb, size)` checks multiplication overflow; on overflow it returns `NULL` and sets `errno = ENOMEM`.
+- `my_realloc(NULL, size)` behaves like `my_malloc(size)`.
+- `my_realloc(ptr, 0)` frees `ptr` and returns `NULL`.
+- Reallocation preserves old bytes up to `min(old_size, new_size)`.
+- `allocator_stats()` prints call counters to `stderr` (malloc/free/calloc/realloc).
 
-- **Small allocations**: if `size <= ALLOC_MAX_SMALL` (64 KiB) and the size maps to a valid class (`my_size_to_class()`), allocation is served from the **thread-local cache** (`tcache_alloc()`), which refills from the **central allocator** as needed.
-- **Large allocations**: everything else goes to `my_large_malloc()` / `my_large_free()` / `my_large_realloc()`, which use a dedicated OS mapping per allocation.
-
-### Architecture diagram
+## High-level architecture
 
 ```mermaid
 flowchart LR
-  subgraph api [Public_API]
+  subgraph api [PublicApi]
     myMalloc[my_malloc]
     myFree[my_free]
     myCalloc[my_calloc]
@@ -35,121 +56,186 @@ flowchart LR
     myStats[allocator_stats]
   end
 
-  subgraph small [Small_allocations_(<=64KiB)]
-    tcache[tcache_(thread_local)]
-    central[central_(per_class_lock)]
-    pageHeap[page_heap_(mmap/VirtualAlloc)]
-    pagemap[pagemap_(page->span_hash)]
+  subgraph smallPath [SmallPath_le_64KiB]
+    tcache[TCacheThreadLocal]
+    central[CentralPerClass]
+    pageHeap[PageHeapMapUnmap]
+    pagemap[PageMap_pageBase_to_span]
   end
 
-  subgraph large [Large_allocations]
-    largeMap[large_(mmap/VirtualAlloc)]
+  subgraph largePath [LargePath]
+    largeAlloc[LargeMappingPerAlloc]
   end
 
-  myMalloc --> tcache
-  myFree --> tcache
-  myRealloc --> tcache
+  myMalloc -->|"size<=64KiB & class>=0"| tcache
+  myCalloc --> myMalloc
+  myRealloc --> pagemap
+  myFree --> pagemap
 
   tcache --> central
   central --> pageHeap
   pageHeap --> pagemap
 
-  myMalloc --> largeMap
-  myFree --> largeMap
-  myRealloc --> largeMap
+  pagemap -->|"small_span"| tcache
+  myMalloc -->|"fallback"| largeAlloc
+  pagemap -->|"not_small"| largeAlloc
 ```
+
+## Small allocation path
 
 ### Size classes
 
-Size class logic lives in:
+Files:
 
-- [`allocator/src/internal/size_classes.h`](allocator/src/internal/size_classes.h)
-- [`allocator/src/core/size_classes.c`](allocator/src/core/size_classes.c)
+- `allocator/src/internal/size_classes.h`
+- `allocator/src/core/size_classes.c`
 
-Key constants/behavior:
+Constants:
 
-- **Max “small” request**: `ALLOC_MAX_SMALL = 64 * 1024` bytes.
-- **Class count**: `ALLOC_CLASS_COUNT = 100`.
-- **Alignment**: `my_alignment()` returns **16 bytes** on 64-bit targets and **8 bytes** on 32-bit targets.
-- **Refill batch size**: `my_class_batch_count()` currently returns **32** for all classes.
+- `ALLOC_MAX_SMALL = 64 * 1024`
+- `ALLOC_CLASS_COUNT = 100`
+
+Behavior:
+
+- `my_size_to_class(size)` maps a request to the first class whose object size fits.
+- `my_class_to_size(class_idx)` returns object size for that class.
+- `my_alignment()` is `16` on 64-bit and `8` on 32-bit.
+- `my_class_batch_count(class_idx)` returns refill/release batch sizes based on class size.
+
+### Span metadata and ownership
+
+Files:
+
+- `allocator/src/internal/my_internal.h`
+- `allocator/src/core/pagemap.c`
+- `allocator/src/platform/page_heap.c`
+
+`my_span` metadata lives at the beginning of each mapped span. Every page in the span is registered into the pagemap (`page_base -> my_span*`), so the allocator can decide if a pointer belongs to the small path.
+
+Pagemap details (current implementation):
+
+- Fixed-capacity open-addressing table with `2^20` slots.
+- Protected by a global mutex.
+
+### Central allocator
+
+File:
+
+- `allocator/src/core/central.c`
+
+Model:
+
+- one central bin per size class,
+- one mutex per bin,
+- a linked list of partially free spans per bin.
+
+Span sizing policy (current implementation):
+
+- Targets ~64 KiB spans for most classes.
+- Uses ~256 KiB target spans when `object_size > 4096`.
+- Rounds span bytes up to OS page size.
+
+Refill flow (`central_refill`):
+
+1. lock class bin,
+2. allocate a span from `page_heap` if no partial span is available,
+3. carve objects from span free list,
+4. return a batch linked list to the caller.
+
+Release flow (`central_release`):
+
+1. lock class bin,
+2. for each object, lookup owning span via pagemap,
+3. push object back to span free list,
+4. reinsert span into partial list if it was previously full.
 
 ### Thread-local cache (tcache)
 
-Implemented in [`allocator/src/core/tcache.c`](allocator/src/core/tcache.c):
+File:
 
-- Uses `_Thread_local` state with one singly-linked free list per size class.
-- On cache miss, refills from central in a batch and returns one object to the caller.
-- Keeps an approximate per-thread cache byte counter and applies a **cap of 4 MiB**; when exceeded, it releases a batch back to central.
+- `allocator/src/core/tcache.c`
 
-### Central allocator and spans
+Model:
 
-Implemented in [`allocator/src/core/central.c`](allocator/src/core/central.c):
+- `_Thread_local` free list array (`ALLOC_CLASS_COUNT` lists),
+- `_Thread_local` object counts per class,
+- `_Thread_local` approximate cached byte budget.
 
-- Maintains a **per-size-class mutex** and a list of non-full spans.
-- When it needs more memory for a class, it allocates a **span** via `page_heap_alloc_span()`, stores `my_span` metadata at the start of the span, and carves fixed-size objects from the remaining span bytes.
-- Span sizing policy:
-  - Targets **64 KiB** spans by default.
-  - Uses **256 KiB** target spans when `object_size > 4096` bytes.
-  - Always rounds span sizes up to the OS page size.
+Flow:
 
-### Pointer → span mapping (pagemap)
+- On allocate: pop local object; if empty, refill a batch from central.
+- On free: push into local list.
+- If thread cache exceeds limits, flush one batch back to central.
 
-Implemented in [`allocator/src/core/pagemap.c`](allocator/src/core/pagemap.c):
+Limits (current implementation):
 
-- A global hash table maps each OS page base address in a span to the owning `my_span*`.
-- Capacity is currently fixed at \(2^{20}\) entries.
-- Protected by a mutex and initialized once; cleaned up at process exit.
+- Approximate per-thread cache cap: 4 MiB.
+- Additional per-class cap: when a class exceeds ~`2 * batch_count`, one batch is flushed.
 
-This pagemap is how `my_free()` decides whether a pointer is part of a small-object span (tcache/central path) or not.
+## Large allocation path
 
-### Large allocations
+File:
 
-Implemented in [`allocator/src/core/large.c`](allocator/src/core/large.c):
+- `allocator/src/core/large.c`
 
-- Each large allocation is a separate mapping using:
-  - `mmap(MAP_PRIVATE|MAP_ANONYMOUS)` on POSIX
-  - `VirtualAlloc(MEM_COMMIT|MEM_RESERVE)` on Windows
-- A header (`large_hdr`) stores a magic value plus `mapped` and `requested` sizes.
-- `my_large_free()` validates the magic and then unmaps the region.
+Behavior:
 
-## Semantics notes
+- one OS mapping per large allocation (`mmap` on POSIX, `VirtualAlloc` on Windows),
+- a `large_hdr` in front of user memory stores magic, requested size, mapped size,
+- free validates magic and unmaps,
+- realloc grows by allocating a new mapping + copying, and shrinks in place by updating requested size.
 
-- **`my_malloc(0)`** returns `NULL`.
-- **`my_free(NULL)`** is a no-op.
-- **`my_calloc(nmemb, size)`** checks for multiplication overflow; on overflow it returns `NULL` and sets `errno = ENOMEM`.
-- **`my_realloc(NULL, size)`** behaves like `my_malloc(size)`; **`my_realloc(ptr, 0)`** frees and returns `NULL`.
+## Platform layer
 
-## Thread-safety model
+File:
 
-The implementation is intended to be usable from multiple threads:
+- `allocator/src/platform/page_heap.c`
 
-- **Fast path** for small allocations is mostly thread-local (`_Thread_local` tcache).
-- **Central allocator** uses **mutexes** (per size class).
-- **Pagemap** uses a **global mutex** for pointer → span lookups/updates.
-- API call counters in `allocator_stats()` are stored in **atomics** (see [`allocator/src/api/alloc_api.c`](allocator/src/api/alloc_api.c)).
+Responsibilities:
 
-## Build & run (Makefile)
+- detect system page size,
+- map/unmap pages from the OS,
+- initialize and register `my_span` for small-path spans.
 
-From the repository root:
+## Build and run
+
+The repository includes a `Makefile`.
+
+Build everything (library + example + tests):
 
 ```bash
 make
+```
+
+Run the example:
+
+```bash
 ./example_usage
 ```
 
-Run tests:
+Build and run all functional tests:
 
 ```bash
 make test
 ```
 
-Run perf micro-benchmark only:
+Run performance micro-benchmark:
 
 ```bash
 make perf
 ```
 
-Clean build artifacts:
+Build variants:
+
+```bash
+make debug
+make release
+make asan
+make tsan
+make ubsan
+```
+
+Clean artifacts:
 
 ```bash
 make clean
@@ -157,31 +243,36 @@ make clean
 
 ## Tests
 
-The `Makefile` builds and/or runs these binaries under `tests/`:
+Tests under `tests/`:
 
-- `tests/test_basic`: API semantics + alignment + calloc zeroing + large allocation path + overflow cases.
-- `tests/test_stress`: randomized allocate/free/realloc loop + prints `allocator_stats()` at the end.
-- `tests/test_realloc_preserve`: checks that realloc preserves the old prefix across growth up to 128 KiB.
-- `tests/test_perf`: simple wall-clock comparison vs libc for `malloc/free` in a tight loop.
-- `tests/test_mt`: multi-threaded randomized workload (uses `-pthread`).
+- `test_basic.c`: base API semantics, alignment, large-path smoke checks, overflow checks.
+- `test_stress.c`: randomized mixed allocation/free/realloc workload.
+- `test_realloc_preserve.c`: verifies preserved prefix during repeated growth.
+- `test_mt.c`: multi-threaded stress and correctness checks.
+- `test_perf.c`: quick `my_malloc/free` vs libc timing loop.
 
-## Repo layout
+## Repository layout
 
-- `allocator/include/`: public header (`allocator.h`)
-- `allocator/src/api/`: public API entry points
-- `allocator/src/core/`: tcache, central allocator, pagemap, size classes, large allocations
-- `allocator/src/internal/`: internal headers (span metadata, locks, helpers)
-- `allocator/src/platform/`: OS mapping + page-size helpers
-- `examples/`: minimal usage example
-- `tests/`: test programs
+- `allocator/include/` - public API headers.
+- `allocator/src/api/` - public API entry points.
+- `allocator/src/core/` - allocator core modules (`size_classes`, `utils`, `pagemap`, `central`, `tcache`, `large`).
+- `allocator/src/internal/` - internal headers and shared internal types.
+- `allocator/src/platform/` - OS abstraction for page mapping and page size.
+- `examples/` - sample program.
+- `tests/` - unit/stress/perf tests.
 
-## Limitations / notes
+## Formatting and development
 
-- **No span reclamation to central/page heap**: spans are allocated on demand, but `central.c` does not currently return completely free spans back to the OS.
-- **Fixed-size pagemap**: `pagemap.c` uses a fixed-capacity table allocated with the host `calloc/free`.
-- **Invalid free behavior**: if a pointer does not resolve to a known small span and is not a valid large allocation header, `my_free()` does nothing (it does not attempt to diagnose arbitrary pointers).
-- **Large allocation overhead/alignment**: large allocations are rounded up to the OS page size and include `large_hdr` overhead.
+- Style is controlled by `.clang-format` (LLVM-based, Allman braces, 4 spaces, 100-column limit).
+- `.gitignore` ignores local build outputs and generated binaries. If you add new source under `allocator/src/core/`, ensure your ignore rules do not accidentally ignore it.
+
+## Known limitations
+
+- No span scavenging back to OS from central bins yet.
+- Fixed-capacity pagemap hash table.
+- Invalid pointer frees are tolerated as no-op if they do not match known small span or valid large header.
+- Size classes are coarse (100 classes across `1..64KiB`) and prioritize simplicity over minimal fragmentation.
 
 ## License
 
-Coursework / educational use.
+This project is licensed under Apache License 2.0. See `LICENSE`.
